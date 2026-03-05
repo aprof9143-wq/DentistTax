@@ -1,0 +1,27 @@
+# ══════════════════════════════════════════════════════════════
+#  Dentists' Tax & Business Architecture System™
+#  Environment Configuration
+# ══════════════════════════════════════════════════════════════
+
+# ── LLM Provider (primary): OpenRouter ────────────────────────
+# Get your key at: https://openrouter.ai
+OPENROUTER_API_KEY=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
+
+# OpenRouter model (default: Claude 3.5 Sonnet — best accuracy)
+# Other options: openai/gpt-4o | meta-llama/llama-3.3-70b-instruct
+OPENROUTER_MODEL=google/gemini-2.0-flash-001
+
+# ── LLM Provider (fallback): Groq ─────────────────────────────
+# Get your key at: https://console.groq.com  (free tier available)
+GROQ_API_KEY=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
+
+# Groq model (default: Llama 3.3 70B — very fast)
+GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
+
+# ── Primary LLM Provider ───────────────────────────────────────
+# "openrouter" (recommended) | "groq" (faster, free tier)
+PRIMARY_PROVIDER=openrouter
+
+# ── Tavily (live tax law research) ────────────────────────────
+# Get your key at: https://tavily.com  (free tier: 1,000 searches/month)
+TAVILY_API_KEY=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
