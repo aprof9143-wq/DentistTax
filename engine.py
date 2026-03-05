@@ -64,7 +64,7 @@ class EngineConfig:
     tavily_api_key: str = ""
 
     # Model selection
-    openrouter_model: str = "anthropic/claude-3.5-sonnet"   # any OpenRouter model
+    openrouter_model: str = "google/gemini-2.0-flash-001"   # any OpenRouter model
     groq_model: str = "llama-3.3-70b-versatile"             # Groq fast model
     primary_provider: str = "openrouter"                     # "openrouter" | "groq"
 
@@ -80,7 +80,7 @@ class EngineConfig:
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
             groq_api_key=os.getenv("GROQ_API_KEY", ""),
             tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
-            openrouter_model=os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet"),
+            openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001"),
             groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
             primary_provider=os.getenv("PRIMARY_PROVIDER", "openrouter"),
         )
