@@ -18,9 +18,9 @@ APIs used:
 
 import os
 import json
-import re
 import time
 import logging
+import base64
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from pathlib import Path
@@ -208,27 +208,16 @@ class TaxReturnJSON:
 
 class PDFExtractor:
     """
-    Extracts raw text from uploaded PDF tax returns.
-    Returns page-by-page text dict for downstream parsing.
+    Extracts raw text from uploaded PDF tax returns using pdfplumber,
+    then uses OpenRouter (Gemini 2.0 Flash) for structured AI extraction —
+    mirroring the parseWithOpenRouter approach in the Deno edge function.
+    No regex patterns are used anywhere in this class.
     """
 
-    DOLLAR_PATTERN = re.compile(r'\$?([\d,]+(?:\.\d{2})?)')
-    LINE_PATTERNS = {
-        # 1040 key lines
-        "agi":             re.compile(r'adjusted gross income.*?\$([\d,]+)', re.I),
-        "taxable_income":  re.compile(r'taxable income.*?\$([\d,]+)', re.I),
-        "total_tax":       re.compile(r'total tax.*?\$([\d,]+)', re.I),
-        "se_tax":          re.compile(r'self.employment tax.*?\$([\d,]+)', re.I),
-        "niit":            re.compile(r'net investment income tax.*?\$([\d,]+)', re.I),
-        "amt":             re.compile(r'alternative minimum tax.*?\$([\d,]+)', re.I),
-        "qbi":             re.compile(r'qualified business income.*?\$([\d,]+)', re.I),
-        "salt":            re.compile(r'state and local taxes.*?\$([\d,]+)', re.I),
-        "w2_wages":        re.compile(r'wages.*?salaries.*?\$([\d,]+)', re.I),
-        # Entity
-        "gross_receipts":  re.compile(r'gross receipts.*?\$([\d,]+)', re.I),
-        "obi":             re.compile(r'ordinary business income.*?\$([\d,]+)', re.I),
-        "officer_comp":    re.compile(r'officer compensation.*?\$([\d,]+)', re.I),
-    }
+    # ── OpenRouter AI extraction (mirrors index.ts parseWithOpenRouter) ──────
+
+    OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+    EXTRACTION_MODEL = "google/gemini-2.0-flash-001"
 
     def extract_from_pdf(self, pdf_path: str) -> dict:
         """Return {page: text, 'all': combined_text, 'raw_lines': [...]}"""
@@ -244,127 +233,396 @@ class PDFExtractor:
         combined = "\n".join(all_text)
         return {"pages": pages, "all": combined, "raw_lines": combined.splitlines()}
 
-    def parse_dollar(self, text: str) -> float:
-        """Extract first dollar amount from text string."""
-        m = self.DOLLAR_PATTERN.search(text)
-        return float(m.group(1).replace(",", "")) if m else 0.0
+    def extract_from_pdf_as_base64(self, pdf_path: str) -> str:
+        """Read a PDF file and return its base64-encoded content (for multimodal API calls)."""
+        with open(pdf_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
 
-    def quick_extract(self, raw_text: str) -> dict:
-        """Fast regex pass over raw text → dict of key financial values."""
-        results = {}
-        for key, pattern in self.LINE_PATTERNS.items():
-            m = pattern.search(raw_text)
-            if m:
-                results[key] = float(m.group(1).replace(",", ""))
-            else:
-                results[key] = 0.0
-        return results
+    def ai_extract_structured(self, raw_text: str, api_key: str) -> dict:
+        """
+        Send extracted PDF text to OpenRouter (Gemini 2.0 Flash) and ask it to
+        return a structured JSON object containing all key financial fields.
+        Mirrors the parseWithOpenRouter logic in index.ts — no regex used.
 
-    def detect_return_types(self, raw_text: str) -> list:
-        types = []
-        if re.search(r'form\s*1040', raw_text, re.I):
-            types.append("1040")
-        if re.search(r'form\s*1120-?s', raw_text, re.I):
-            types.append("1120S")
-        if re.search(r'form\s*1120\b', raw_text, re.I):
-            if "1120S" not in types:
-                types.append("1120")
-        if re.search(r'form\s*1065', raw_text, re.I):
-            types.append("1065")
-        return types or ["1040"]
+        Returns a dict with all financial fields, or an empty dict on failure.
+        """
+        if not api_key:
+            logger.warning("No OPENROUTER_API_KEY — AI structured extraction skipped.")
+            return {}
 
-    def detect_states(self, raw_text: str) -> list:
-        state_forms = re.findall(r'\b([A-Z]{2})\s+(?:form|return|schedule|income tax)', raw_text, re.I)
-        return list(set(s.upper() for s in state_forms)) if state_forms else []
+        extraction_prompt = """You are a tax return data extraction expert for a US dental practice tax analysis system.
+
+Extract ALL key financial data from the tax return text below and return ONLY a valid JSON object.
+
+CRITICAL INSTRUCTIONS:
+- Extract every number exactly as it appears — no rounding, no estimation
+- Return ONLY the JSON object, with no commentary, markdown, or code fences
+- If a field is not present in the document, use 0 for numeric fields, "" for strings, false for booleans, and [] for arrays
+- All dollar amounts must be plain numbers (e.g. 425000, not "$425,000")
+
+Return this exact JSON structure:
+{
+  "return_types": [],
+  "states": [],
+  "primary_state": "",
+  "agi": 0,
+  "taxable_income": 0,
+  "total_tax": 0,
+  "se_tax": 0,
+  "niit": 0,
+  "amt": 0,
+  "qbi_deduction": 0,
+  "salt_deduction": 0,
+  "w2_wages": 0,
+  "federal_withholding": 0,
+  "estimated_payments": 0,
+  "charitable_contributions": 0,
+  "standard_deduction_used": false,
+  "gross_receipts": 0,
+  "ordinary_business_income": 0,
+  "officer_compensation": 0,
+  "owner_wages": 0,
+  "distributions": 0,
+  "rent_paid": 0,
+  "health_insurance_expense": 0,
+  "retirement_plan_expense": 0,
+  "section_179": 0,
+  "bonus_depreciation": 0,
+  "depreciation_total": 0,
+  "meals_entertainment": 0,
+  "travel": 0,
+  "auto_truck": 0,
+  "professional_fees": 0,
+  "state_tax_expense": 0,
+  "entity_name": "",
+  "entity_type": "",
+  "schedule_c_present": false,
+  "schedule_e_present": false,
+  "real_estate_activity_present": false,
+  "dependents_present": false,
+  "ptet_election_detected": false,
+  "tax_planning_fees_detected": false,
+  "dentist_indicator": "",
+  "schedule_e_properties": []
+}
+
+TAX RETURN TEXT:
+"""
+
+        payload = {
+            "model": self.EXTRACTION_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": extraction_prompt + raw_text[:40000],  # cap to avoid token overflow
+                }
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.0,
+        }
+
+        try:
+            resp = requests.post(
+                self.OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://cortex-research.com",
+                    "X-Title": "Cortex Tax Extraction Engine",
+                },
+                json=payload,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+
+            # Strip any accidental markdown fences before parsing
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            content = content.strip()
+
+            extracted = json.loads(content)
+            logger.info(f"AI structured extraction successful: {len(extracted)} fields")
+            return extracted
+
+        except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
+            logger.warning(f"AI structured extraction failed: {e}")
+            return {}
+
+    def ai_extract_from_pdf_base64(self, pdf_path: str, api_key: str) -> dict:
+        """
+        Alternative: send the raw PDF bytes as base64 to OpenRouter's multimodal API
+        (Gemini 2.0 Flash vision) for extraction — mirrors parseWithOpenRouter in index.ts
+        which sends the file directly as a base64 image_url.
+        Used when pdfplumber text extraction is insufficient (scanned/image PDFs).
+        """
+        if not api_key:
+            logger.warning("No OPENROUTER_API_KEY — multimodal PDF extraction skipped.")
+            return {}
+
+        try:
+            b64 = self.extract_from_pdf_as_base64(pdf_path)
+            logger.info(f"Sending PDF to OpenRouter multimodal, base64 length: {len(b64)}")
+        except OSError as e:
+            logger.warning(f"Could not read PDF for base64 encoding: {e}")
+            return {}
+
+        extraction_prompt = """You are a tax return data extraction expert. Extract ALL structured financial data from this PDF tax return.
+
+Return ONLY a valid JSON object (no markdown, no commentary) with this structure:
+{
+  "return_types": [],
+  "states": [],
+  "primary_state": "",
+  "agi": 0,
+  "taxable_income": 0,
+  "total_tax": 0,
+  "se_tax": 0,
+  "niit": 0,
+  "amt": 0,
+  "qbi_deduction": 0,
+  "salt_deduction": 0,
+  "w2_wages": 0,
+  "federal_withholding": 0,
+  "estimated_payments": 0,
+  "charitable_contributions": 0,
+  "standard_deduction_used": false,
+  "gross_receipts": 0,
+  "ordinary_business_income": 0,
+  "officer_compensation": 0,
+  "owner_wages": 0,
+  "distributions": 0,
+  "rent_paid": 0,
+  "health_insurance_expense": 0,
+  "retirement_plan_expense": 0,
+  "section_179": 0,
+  "bonus_depreciation": 0,
+  "depreciation_total": 0,
+  "meals_entertainment": 0,
+  "travel": 0,
+  "auto_truck": 0,
+  "professional_fees": 0,
+  "state_tax_expense": 0,
+  "entity_name": "",
+  "entity_type": "",
+  "schedule_c_present": false,
+  "schedule_e_present": false,
+  "real_estate_activity_present": false,
+  "dependents_present": false,
+  "ptet_election_detected": false,
+  "tax_planning_fees_detected": false,
+  "dentist_indicator": "",
+  "schedule_e_properties": []
+}"""
+
+        payload = {
+            "model": self.EXTRACTION_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": extraction_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:application/pdf;base64,{b64}"},
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.0,
+        }
+
+        try:
+            resp = requests.post(
+                self.OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://cortex-research.com",
+                    "X-Title": "Cortex Tax Extraction Engine",
+                },
+                json=payload,
+                timeout=45,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            content = content.strip()
+
+            extracted = json.loads(content)
+            logger.info(f"Multimodal PDF extraction successful: {len(extracted)} fields")
+            return extracted
+
+        except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
+            logger.warning(f"Multimodal PDF extraction failed: {e}")
+            return {}
+
+    # ── TaxReturnJSON builders ────────────────────────────────────────────────
 
     def build_return_json(self, pdf_path: str, client_id: str = "CLIENT_001",
-                          tax_year: int = 2024) -> TaxReturnJSON:
-        """Full pipeline: PDF → TaxReturnJSON."""
+                          tax_year: int = 2024,
+                          openrouter_api_key: str = "") -> TaxReturnJSON:
+        """
+        Full pipeline: PDF → raw text (pdfplumber) → AI structured extraction
+        (OpenRouter) → TaxReturnJSON.
+        Falls back to multimodal base64 extraction if text yield is too low.
+        """
+        api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")
+
         raw = self.extract_from_pdf(pdf_path)
-        return self._text_to_json(raw["all"], client_id, tax_year)
+        raw_text = raw["all"]
+
+        # If pdfplumber yields meaningful text, use AI text extraction
+        if len(raw_text.strip()) > 200:
+            extracted = self.ai_extract_structured(raw_text, api_key)
+        else:
+            # Scanned/image PDF: send bytes directly (mirrors index.ts parseWithOpenRouter)
+            logger.info("Low text yield from pdfplumber — falling back to multimodal base64 extraction")
+            extracted = self.ai_extract_from_pdf_base64(pdf_path, api_key)
+
+        return self._extracted_to_json(extracted, raw_text, client_id, tax_year)
 
     def build_return_json_from_text(self, raw_text: str, client_id: str = "CLIENT_001",
-                                     tax_year: int = 2024) -> TaxReturnJSON:
-        return self._text_to_json(raw_text, client_id, tax_year)
+                                     tax_year: int = 2024,
+                                     openrouter_api_key: str = "") -> TaxReturnJSON:
+        """Pipeline from pre-extracted raw text string."""
+        api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")
+        extracted = self.ai_extract_structured(raw_text, api_key)
+        return self._extracted_to_json(extracted, raw_text, client_id, tax_year)
 
-    def _text_to_json(self, raw_text: str, client_id: str, tax_year: int) -> TaxReturnJSON:
-        extracted = self.quick_extract(raw_text)
-        return_types = self.detect_return_types(raw_text)
-        states = self.detect_states(raw_text)
+    def _extracted_to_json(self, extracted: dict, raw_text: str,
+                            client_id: str, tax_year: int) -> TaxReturnJSON:
+        """
+        Convert the AI-extracted dict (from OpenRouter) into a TaxReturnJSON.
+        All field mapping is done via dict.get() — no regex anywhere.
+        """
+        def _f(key: str) -> float:
+            """Safe float getter."""
+            val = extracted.get(key, 0)
+            try:
+                return float(val) if val else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _b(key: str) -> bool:
+            return bool(extracted.get(key, False))
+
+        def _s(key: str) -> str:
+            return str(extracted.get(key, "") or "")
+
+        def _l(key: str) -> list:
+            val = extracted.get(key, [])
+            return val if isinstance(val, list) else []
 
         fed = FederalNumbers(
-            agi=extracted["agi"],
-            taxable_income=extracted["taxable_income"],
-            total_tax=extracted["total_tax"],
-            self_employment_tax=extracted["se_tax"],
-            niit=extracted["niit"],
-            amt=extracted["amt"],
-            qbi_deduction=extracted["qbi"],
-            salt_deduction_claimed=extracted["salt"],
-            w2_wages=extracted["w2_wages"],
-            itemized_deductions=extracted["salt"] * 3 if extracted["salt"] else 0,
+            agi=_f("agi"),
+            taxable_income=_f("taxable_income"),
+            total_tax=_f("total_tax"),
+            self_employment_tax=_f("se_tax"),
+            niit=_f("niit"),
+            amt=_f("amt"),
+            qbi_deduction=_f("qbi_deduction"),
+            salt_deduction_claimed=_f("salt_deduction"),
+            w2_wages=_f("w2_wages"),
+            federal_withholding=_f("federal_withholding"),
+            estimated_payments=_f("estimated_payments"),
+            charitable_contributions=_f("charitable_contributions"),
+            standard_deduction_used=_b("standard_deduction_used"),
+            itemized_deductions=_f("salt_deduction") * 3 if _f("salt_deduction") else 0,
         )
 
-        # Estimate marginal rate
-        if fed.taxable_income > 731200:
-            fed.marginal_rate_estimate = 0.37
-        elif fed.taxable_income > 487450:
-            fed.marginal_rate_estimate = 0.35
-        elif fed.taxable_income > 231250:
-            fed.marginal_rate_estimate = 0.32
-        elif fed.taxable_income > 100525:
-            fed.marginal_rate_estimate = 0.24
-        elif fed.taxable_income > 47150:
-            fed.marginal_rate_estimate = 0.22
-        else:
-            fed.marginal_rate_estimate = 0.12
+        # Marginal rate estimation from taxable income brackets
+        ti = fed.taxable_income
+        if ti > 731200:       fed.marginal_rate_estimate = 0.37
+        elif ti > 487450:     fed.marginal_rate_estimate = 0.35
+        elif ti > 231250:     fed.marginal_rate_estimate = 0.32
+        elif ti > 100525:     fed.marginal_rate_estimate = 0.24
+        elif ti > 47150:      fed.marginal_rate_estimate = 0.22
+        else:                  fed.marginal_rate_estimate = 0.12
 
-        # Entity detection
+        # Entity construction from AI-extracted fields
         entities = []
-        if "1120S" in return_types or "1120" in return_types or "1065" in return_types:
+        return_types = _l("return_types") or ["1040"]
+        entity_type = _s("entity_type")
+
+        if entity_type in ("1120S", "1120", "1065") or any(
+            t in return_types for t in ["1120S", "1120", "1065"]
+        ):
             ent = EntityRecord(
                 entity_id="E1",
-                entity_name=self._guess_entity_name(raw_text),
-                entity_type=next((t for t in ["1120S","1120","1065"] if t in return_types), "1120S"),
-                gross_receipts=extracted["gross_receipts"],
-                ordinary_business_income=extracted["obi"],
-                officer_compensation=extracted["officer_comp"],
+                entity_name=_s("entity_name") or "Practice Entity",
+                entity_type=entity_type or next(
+                    (t for t in ["1120S", "1120", "1065"] if t in return_types), "1120S"
+                ),
+                gross_receipts=_f("gross_receipts"),
+                ordinary_business_income=_f("ordinary_business_income"),
+                officer_compensation=_f("officer_compensation"),
+                owner_wages=_f("owner_wages"),
+                distributions=_f("distributions"),
+                rent_paid=_f("rent_paid"),
+                health_insurance_expense=_f("health_insurance_expense"),
+                retirement_plan_expense=_f("retirement_plan_expense"),
+                section_179=_f("section_179"),
+                bonus_depreciation=_f("bonus_depreciation"),
+                depreciation_total=_f("depreciation_total"),
+                meals_entertainment=_f("meals_entertainment"),
+                travel=_f("travel"),
+                auto_truck=_f("auto_truck"),
+                professional_fees=_f("professional_fees"),
+                tax_planning_fees_detected=_b("tax_planning_fees_detected"),
+                state_tax_expense=_f("state_tax_expense"),
             )
             entities.append(ent)
 
-        state_numbers = {}
-        for state in states:
-            state_numbers[state] = StateNumbers()
+        states = _l("states")
+        state_numbers = {state: StateNumbers() for state in states}
+
+        # Depreciation summary
+        dep = DepreciationSummary(
+            has_depreciation=_f("depreciation_total") > 0,
+            section_179_claimed=_f("section_179"),
+            bonus_depreciation_claimed=_f("bonus_depreciation"),
+            total_depreciation=_f("depreciation_total"),
+        )
+
+        # Dentist indicator — AI should detect from document content
+        dentist_indicator = _s("dentist_indicator").upper()
+        if dentist_indicator not in ("CONFIRMED", "LIKELY", "UNKNOWN"):
+            dentist_indicator = "UNKNOWN"
 
         ret = TaxReturnJSON(
             client_id=client_id,
             tax_year=tax_year,
             return_types=return_types,
             state_returns_present=states,
-            primary_state=states[0] if states else "",
+            primary_state=_s("primary_state") or (states[0] if states else ""),
+            ptet_election_detected=_b("ptet_election_detected"),
             federal=fed,
             states=state_numbers,
             entities=entities,
+            depreciation=dep,
             high_income=fed.agi > 300_000,
             meaningful_tax_liability=fed.total_tax > 70_000,
-            w2_present=bool(extracted["w2_wages"]),
+            w2_present=bool(fed.w2_wages),
             k1_present=len(entities) > 0,
-            schedule_c_present=bool(extracted.get("schedule_c", 0)),
-            real_estate_activity_present="schedule_e" in raw_text.lower(),
-            dependents_present=bool(re.search(r'dependent', raw_text, re.I)),
-            confidence=0.75,
+            schedule_c_present=_b("schedule_c_present"),
+            schedule_e_present=_b("schedule_e_present"),
+            real_estate_activity_present=_b("real_estate_activity_present"),
+            dependents_present=_b("dependents_present"),
+            dentist_indicator=dentist_indicator,
+            confidence=0.88 if extracted else 0.40,
         )
 
-        # Detect dentist indicator
-        dental_keywords = ["dental", "dds", "dmd", "orthodont", "periodon", "endodon",
-                           "oral", "prosthodon"]
-        if any(kw in raw_text.lower() for kw in dental_keywords):
-            ret.dentist_indicator = "CONFIRMED"
         return ret
-
-    def _guess_entity_name(self, raw_text: str) -> str:
-        m = re.search(r'(?:name of corporation|business name)[:\s]+([A-Za-z0-9 ,\.]+)', raw_text, re.I)
-        return m.group(1).strip() if m else "Practice Entity"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1234,7 +1492,7 @@ class LLMClient:
         self.config = config
 
     def complete(self, system_prompt: str, user_prompt: str,
-                 max_tokens: int = 2500, temperature: float = 0.1) -> str:
+                 max_tokens: int = 4000, temperature: float = 0.1) -> str:
         """Run completion — tries primary, falls back to secondary."""
         if self.config.primary_provider == "openrouter":
             result = self._openrouter(system_prompt, user_prompt, max_tokens, temperature)
@@ -1384,56 +1642,222 @@ class ReportAssembler:
 #  AI SYNTHESIS PROMPTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """You are the Dentists' Tax & Business Architecture Risk Assessment Engine.
-You analyze tax returns ONLY (no questionnaire data in Phase 1).
-Your job: produce a concise, specific, high-value risk summary for a licensed Tax & Business Architect.
+SYSTEM_PROMPT = """You are the Senior Tax Architecture Partner at Dentists' Tax & Business Architecture™ — the firm's most senior analytical voice, operating at the standard of a Big Four (Deloitte, KPMG, PwC, EY) National Tax Practice lead combined with a McKinsey senior partner's executive communication discipline.
 
-Rules:
-- Reference only what is evidenced in the return data provided
-- Be specific about IRC sections and tax mechanics
-- Rank concerns by dollar materiality
-- Do NOT fabricate numbers — use the ranges provided
-- Keep response under 400 words
-- Tone: professional, direct, CPA-ready
-- End with: "Phase 2 questionnaire will confirm: [3 key facts needed]"
+═══════════════════════════════════════════════════════════════
+MANDATE & ANALYTICAL STANDARD
+═══════════════════════════════════════════════════════════════
+
+Your output is a CONFIDENTIAL TAX ARCHITECTURE RISK MEMORANDUM delivered to a licensed Tax & Business Architect. It will be presented directly to a high-net-worth dental practice owner. Every sentence must earn its place. Every number must be traceable. Every recommendation must be defensible under IRC scrutiny.
+
+You are NOT a generic AI assistant summarizing data. You are a specialist who:
+  • Thinks in IRC sections, Treasury Regulations, Revenue Rulings, and PLRs
+  • Quantifies risk and opportunity in hard dollar ranges — never vague language
+  • Identifies the gap between what was done and what SHOULD have been done
+  • Frames every finding against the client's cost: how much did inaction cost this year?
+  • Writes with the precision of a Big Four tax opinion letter and the clarity of a McKinsey executive briefing
+
+═══════════════════════════════════════════════════════════════
+REPORT STRUCTURE — FOLLOW THIS EXACTLY
+═══════════════════════════════════════════════════════════════
+
+## EXECUTIVE SUMMARY
+Write 3–4 sentences that a dental practice owner (not a CPA) can read in 30 seconds. State:
+  (1) The single most important finding
+  (2) The estimated total tax savings opportunity in a clear dollar range
+  (3) The urgency level and one key action required
+Do NOT use jargon in this section. This is the client-facing opener.
+
+## TAX ARCHITECTURE ASSESSMENT
+Lead with the Tax Bleed Score and its meaning in plain terms. Then systematically evaluate the practice's current tax architecture across four dimensions:
+  1. ENTITY STRUCTURE EFFICIENCY — Is the entity type, salary/distribution ratio, and ownership structure optimized? What is the estimated SE tax bleed vs. optimal?
+  2. INCOME DEFERRAL & SHELTER CAPACITY — What retirement and defined benefit capacity is being left on the table? Dollar-quantify the missed shelter.
+  3. DEDUCTION ARCHITECTURE — What deductions are present, absent, or structurally underperforming? Reference specific IRC sections.
+  4. STATE & MULTI-JURISDICTIONAL EXPOSURE — PTET, SALT cap impacts, state conformity gaps. Quantify the recoverable state tax where applicable.
+
+For each dimension, use this format:
+  FINDING: [What the return reveals]
+  GAP: [What is missing or suboptimal — with IRC reference]
+  DOLLAR IMPACT: [Estimated annual cost of inaction, in a range]
+
+## RISK STRATIFICATION MATRIX
+Classify the top 3–5 risks into:
+  CRITICAL (act within 30 days — year-end or statute-sensitive)
+  HIGH (act within 90 days — material savings, low complexity)
+  MEDIUM (act within 180 days — meaningful but not urgent)
+
+For each: state the IRC authority, the specific risk, the dollar exposure, and the single action required.
+
+## STRATEGIC OPPORTUNITY RANKING
+For each ranked strategy provided, write a structured analysis block:
+
+  ▸ [STRATEGY NAME] — [IRC AUTHORITY]
+  Opportunity: [1 sentence plain-English description]
+  Evidence from Return: [Specific data points from the return that confirm eligibility]
+  Federal Tax Impact: $[low]–$[high] annual savings
+  State Tax Impact: $[low]–$[high] (or "N/A — state decouples")
+  Implementation Timeline: [X days] | Complexity: [Low/Medium/High]
+  Audit Exposure: [Low/Medium/High] — [one-sentence rationale]
+  CPA Action Required: [Specific, actionable instruction]
+  Prerequisite: [If any — be specific]
+
+## ARCHITECTURAL DIAGNOSIS
+Write 2–3 paragraphs (McKinsey "so what" style) that synthesize the above into a cohesive architectural picture. Answer:
+  • What does this return tell us about how this practice has been managed from a tax perspective?
+  • What is the single structural change that would have the greatest compounding impact over 5 years?
+  • What does this client's trajectory look like if nothing changes vs. if the top 3 strategies are implemented?
+
+Be direct. Be specific. Do not hedge with phrases like "it may be possible" or "you might consider." Use declarative language: "This practice is leaving $X on the table annually. The primary cause is Y. The solution is Z."
+
+## PHASE 2 CONFIRMATION REQUIREMENTS
+End with exactly this format:
+"To finalize this assessment and move to implementation, Phase 2 questionnaire must confirm:
+  1. [Specific fact #1 — e.g., "Exact reasonable compensation benchmark for this specialty and market"]
+  2. [Specific fact #2]
+  3. [Specific fact #3]"
+
+═══════════════════════════════════════════════════════════════
+NON-NEGOTIABLE STANDARDS
+═══════════════════════════════════════════════════════════════
+
+ACCURACY: Reference only data from the return provided. Do NOT fabricate numbers.
+PRECISION: Every savings estimate must cite its calculation basis (e.g., "$18,400 = $120K excess distributions × 15.3% FICA × 1.0").
+TONE: Authoritative, precise, direct. Write like a senior partner who charges $1,000/hour and respects the client's intelligence.
+LENGTH: 600–900 words. Dense with substance. No filler. No repetition.
+IRC DISCIPLINE: Every recommendation must cite at least one IRC section, Treasury Regulation, or Revenue Ruling.
+CONFIDENTIALITY MARKER: Begin every response with: "CONFIDENTIAL — TAX ARCHITECTURE MEMORANDUM" on its own line.
 """
+
 
 def build_synthesis_prompt(ret: TaxReturnJSON, exposure: ExposureScore,
                             strategies: list[ScoredStrategy],
                             research_notes: list) -> str:
-    strat_summary = "\n".join(
-        f"  {i+1}. {s.strategy_name} | Score: {s.total_score} | "
-        f"Fed savings: ${s.federal_savings_low:,.0f}–${s.federal_savings_high:,.0f}"
-        for i, s in enumerate(strategies[:6])
-    )
+    """
+    Builds a comprehensive, data-rich user prompt for the LLM.
+    Provides full financial context, exposure analysis, and ranked strategies
+    so the AI can produce a McKinsey/Big Four-grade report.
+    """
+    # ── Financial profile block ──
+    combined_tax = ret.federal.total_tax + sum(s.state_total_tax for s in ret.states.values())
+    effective_rate = (combined_tax / ret.federal.agi * 100) if ret.federal.agi else 0
+    entity_count = len(ret.entities)
+    primary_entity = ret.entities[0] if ret.entities else None
 
-    research_text = ""
+    entity_block = ""
+    if primary_entity:
+        distributions_vs_wages_ratio = (
+            f"{primary_entity.distributions / primary_entity.owner_wages:.1f}x"
+            if primary_entity.owner_wages > 0 else "N/A (no owner wages detected)"
+        )
+        entity_block = f"""
+ENTITY DATA ({primary_entity.entity_type} — {primary_entity.entity_name}):
+  Gross Receipts:              ${primary_entity.gross_receipts:,.0f}
+  Ordinary Business Income:    ${primary_entity.ordinary_business_income:,.0f}
+  Officer/Owner Compensation:  ${primary_entity.officer_compensation or primary_entity.owner_wages:,.0f}
+  Distributions:               ${primary_entity.distributions:,.0f}
+  Distributions-to-Wages Ratio:{distributions_vs_wages_ratio}
+  Retirement Plan Expense:     ${primary_entity.retirement_plan_expense:,.0f}
+  Depreciation (Total):        ${primary_entity.depreciation_total:,.0f}
+  Section 179:                 ${primary_entity.section_179:,.0f}
+  Bonus Depreciation:          ${primary_entity.bonus_depreciation:,.0f}
+  Health Insurance Expense:    ${primary_entity.health_insurance_expense:,.0f}
+  Meals & Entertainment:       ${primary_entity.meals_entertainment:,.0f}
+  Travel:                      ${primary_entity.travel:,.0f}
+  Auto/Truck:                  ${primary_entity.auto_truck:,.0f}
+  Professional Fees:           ${primary_entity.professional_fees:,.0f}
+  Tax Planning Fees Present:   {"YES" if primary_entity.tax_planning_fees_detected else "NO — architectural gap signal"}"""
+
+    # ── Strategy detail block ──
+    strat_details = []
+    for i, s in enumerate(strategies[:8], 1):
+        strat_details.append(
+            f"  {i:>2}. [{s.total_score:.0f}pts] {s.strategy_name}\n"
+            f"       IRC: {s.irc_authority}\n"
+            f"       Federal: ${s.federal_savings_low:,.0f}–${s.federal_savings_high:,.0f} | "
+            f"State: ${s.state_savings_low:,.0f}–${s.state_savings_high:,.0f}\n"
+            f"       Time: {s.time_to_implement_days}d | Complexity: {s.complexity}/100 | "
+            f"Audit Risk: {s.audit_friction}/100\n"
+            f"       Evidence: {'; '.join(s.evidence_basis[:2])}"
+        )
+    strat_block = "\n".join(strat_details)
+
+    # ── Research enrichment block ──
+    research_block = ""
     if research_notes:
-        research_text = "\n\nLIVE RESEARCH CONTEXT:\n" + "\n".join(
-            f"- {note}" for note in research_notes[:3]
+        research_block = "\nLIVE RESEARCH CONTEXT (Tavily — current IRS guidance):\n" + "\n".join(
+            f"  • {note}" for note in research_notes[:4]
         )
 
-    return f"""RETURN ANALYSIS DATA:
-Tax Year: {ret.tax_year}
-Return Types: {', '.join(ret.return_types)}
-Primary State: {ret.primary_state or 'Not detected'}
+    # ── State exposure block ──
+    state_block = ""
+    if ret.states:
+        state_lines = []
+        for state_code, state_data in ret.states.items():
+            state_lines.append(
+                f"  {state_code}: Taxable Income ${state_data.state_taxable_income:,.0f} | "
+                f"Tax ${state_data.state_total_tax:,.0f} | "
+                f"Effective Rate {state_data.effective_rate_estimate:.1%}"
+            )
+        state_block = "\nSTATE RETURN DATA:\n" + "\n".join(state_lines)
+        state_block += f"\n  PTET Election Detected: {'YES' if ret.ptet_election_detected else 'NO'}"
 
-FINANCIAL SUMMARY:
-AGI: ${ret.federal.agi:,.0f}
-Federal Taxable Income: ${ret.federal.taxable_income:,.0f}
-Federal Total Tax: ${ret.federal.total_tax:,.0f}
-SE Tax: ${ret.federal.self_employment_tax:,.0f}
-QBI Claimed: ${ret.federal.qbi_deduction:,.0f}
-State Tax: ${sum(s.state_total_tax for s in ret.states.values()):,.0f}
+    return f"""CONFIDENTIAL CLIENT FILE — TAX ARCHITECTURE ANALYSIS REQUEST
 
-EXPOSURE SCORE: {exposure.raw_score}/100 — {exposure.band_label}
-Drivers: {'; '.join(exposure.top_drivers[:3])}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CLIENT PROFILE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Client ID:         {ret.client_id}
+Tax Year:          {ret.tax_year}
+Return Types:      {', '.join(ret.return_types)}
+Dentist Profile:   {ret.dentist_indicator}
+Entity Count:      {entity_count}
+Primary State:     {ret.primary_state or 'Not detected'}
 
-TOP RANKED STRATEGIES:
-{strat_summary}
-{research_text}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEDERAL TAX SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Adjusted Gross Income (AGI):       ${ret.federal.agi:,.0f}
+Federal Taxable Income:            ${ret.federal.taxable_income:,.0f}
+Federal Total Tax:                 ${ret.federal.total_tax:,.0f}
+Combined Fed + State Tax:          ${combined_tax:,.0f}
+Combined Effective Rate:           {effective_rate:.1f}%
+Marginal Rate (Est.):              {ret.federal.marginal_rate_estimate:.0%}
+Self-Employment Tax:               ${ret.federal.self_employment_tax:,.0f}
+Net Investment Income Tax (NIIT):  ${ret.federal.niit:,.0f}
+Alternative Minimum Tax (AMT):     ${ret.federal.amt:,.0f}
+QBI Deduction (§199A) Claimed:     ${ret.federal.qbi_deduction:,.0f}
+SALT Deduction Claimed:            ${ret.federal.salt_deduction_claimed:,.0f}
+W-2 Wages:                         ${ret.federal.w2_wages:,.0f}
+Retirement Contributions:          ${ret.retirement_contributions:,.0f}
+{entity_block}
+{state_block}
 
-Provide a concise architectural risk assessment and synthesis."""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TAX BLEED EXPOSURE SCORE: {exposure.raw_score}/100 — {exposure.band_label.upper()}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Liability Intensity:      {exposure.liability_intensity:.0f}/100
+Structural Inefficiency:  {exposure.structural_inefficiency:.0f}/100
+Opportunity Density:      {exposure.opportunity_density:.0f}/100
+Top Exposure Drivers:
+{chr(10).join(f"  • {d}" for d in exposure.top_drivers)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RANKED STRATEGIES ({len(strategies)} identified)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{strat_block}
+{research_block}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RETURN FLAGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+High Income (AGI > $300K):           {"YES" if ret.high_income else "NO"}
+Meaningful Tax Liability (> $70K):   {"YES" if ret.meaningful_tax_liability else "NO"}
+Schedule C Present:                  {"YES" if ret.schedule_c_present else "NO"}
+Schedule E / Real Estate:            {"YES" if ret.real_estate_activity_present else "NO"}
+Dependents Present:                  {"YES" if ret.dependents_present else "NO"}
+K-1 / Entity Returns Present:        {"YES" if ret.k1_present else "NO"}
+
+Produce the full Tax Architecture Risk Memorandum per your mandate."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1460,7 +1884,10 @@ class DentistTaxEngine:
     def analyze_pdf(self, pdf_path: str, client_id: str = "CLIENT_001",
                     tax_year: int = 2024) -> AssessmentReport:
         """Full pipeline from PDF file."""
-        ret = self.extractor.build_return_json(pdf_path, client_id, tax_year)
+        ret = self.extractor.build_return_json(
+            pdf_path, client_id, tax_year,
+            openrouter_api_key=self.config.openrouter_api_key
+        )
         return self._run_analysis(ret)
 
     def analyze_return(self, ret: TaxReturnJSON) -> AssessmentReport:
@@ -1470,7 +1897,10 @@ class DentistTaxEngine:
     def analyze_text(self, raw_text: str, client_id: str = "CLIENT_001",
                      tax_year: int = 2024) -> AssessmentReport:
         """Full pipeline from raw extracted PDF text string."""
-        ret = self.extractor.build_return_json_from_text(raw_text, client_id, tax_year)
+        ret = self.extractor.build_return_json_from_text(
+            raw_text, client_id, tax_year,
+            openrouter_api_key=self.config.openrouter_api_key
+        )
         return self._run_analysis(ret)
 
     def _run_analysis(self, ret: TaxReturnJSON) -> AssessmentReport:
