@@ -1,5 +1,1377 @@
 """
 Dentists' Tax & Business Architecture System™
+Run:  pip install streamlit pdfplumber requests
+      streamlit run app.py
+"""
+
+import os, re, time, tempfile
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+
+import streamlit as st
+
+st.set_page_config(
+    page_title="Dentists' Tax Architecture System™",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── .env loader ───────────────────────────────────────────────────────────────
+def _env(p=".env"):
+    if Path(p).exists():
+        for ln in Path(p).read_text().splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith("#") and "=" in ln:
+                k, v = ln.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+_env()
+
+# ── optional deps ─────────────────────────────────────────────────────────────
+try:    import pdfplumber;                   PDF_OK = True
+except: PDF_OK = False
+try:    from new_strategies import STRATEGY_LIBRARY; STRAT_OK = True
+except: STRATEGY_LIBRARY = [];               STRAT_OK = False
+
+# ── session defaults ──────────────────────────────────────────────────────────
+for k, v in [("report_done", False), ("ai_result", ""), ("upload_name", "")]:
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DESIGN TOKENS & STYLES
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --navy:    #09192F;
+  --navy-lt: #122040;
+  --gold:    #BFA05A;
+  --gold-lt: #D4B978;
+  --cream:   #F7F3EC;
+  --white:   #FFFFFF;
+  --ink:     #1A1F2E;
+  --slate:   #3D4555;
+  --muted:   #7A8099;
+  --border:  #DDD8CE;
+  --b2:      #EAE6DC;
+  --ok:      #0E7A62;
+  --ok-lt:   #E6F7F3;
+  --ok-bdr:  #74C5AE;
+  --warn:    #B07010;
+  --warn-lt: #FEF9ED;
+  --warn-bdr:#E0C060;
+  --bad:     #A82818;
+  --bad-lt:  #FEF3F2;
+  --bad-bdr: #F2B8B0;
+}
+
+/* ── globals ── */
+html, body, [class*="css"] {
+  font-family: 'Inter', sans-serif;
+  background: var(--cream);
+  color: var(--ink);
+}
+.stApp { background: var(--cream); }
+.block-container { padding-top: 0 !important; max-width: 100% !important; }
+
+/* ── sidebar ── */
+section[data-testid="stSidebar"] {
+  background: var(--navy) !important;
+  border-right: 2px solid var(--gold);
+}
+section[data-testid="stSidebar"] * { color: #C0CCDC !important; }
+section[data-testid="stSidebar"] h3 {
+  color: var(--gold) !important;
+  font-family: 'Cormorant Garamond', serif !important;
+  font-size: 1rem !important;
+  letter-spacing: .04em;
+  margin-bottom: .45rem !important;
+}
+section[data-testid="stSidebar"] .stTextInput label {
+  color: #7080A0 !important;
+  font-size: .6rem !important;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+  font-weight: 600;
+}
+section[data-testid="stSidebar"] input {
+  background: rgba(255,255,255,.05) !important;
+  border-color: rgba(191,160,90,.25) !important;
+  color: #EBF0FA !important;
+  font-family: 'IBM Plex Mono', monospace !important;
+  font-size: .75rem !important;
+}
+
+/* ── page header ── */
+.phdr {
+  background: var(--navy);
+  padding: 1.75rem 2.4rem 1.5rem;
+  margin: -1rem -1rem 0 -1rem;
+  border-bottom: 2px solid var(--gold);
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+.phdr-title {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.9rem;
+  font-weight: 700;
+  color: #FFF;
+  letter-spacing: -.01em;
+  line-height: 1.1;
+}
+.phdr-sub {
+  font-size: .58rem;
+  text-transform: uppercase;
+  letter-spacing: .24em;
+  color: var(--gold);
+  margin-top: .3rem;
+  font-weight: 500;
+}
+.phdr-meta {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: .5rem;
+  color: rgba(255,255,255,.2);
+  text-align: right;
+  line-height: 2;
+}
+
+/* ── col header ── */
+.col-hdr {
+  font-size: .56rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .24em;
+  color: var(--muted);
+  padding-bottom: .4rem;
+  border-bottom: 1px solid var(--b2);
+  margin-bottom: .9rem;
+}
+
+/* ── upload ── */
+.upwell {
+  background: var(--white);
+  border: 1.5px dashed var(--border);
+  border-radius: 12px;
+  padding: 2.2rem 1.5rem;
+  text-align: center;
+  margin-bottom: .75rem;
+}
+.upwell-icon  { font-size: 2rem; display: block; margin-bottom: .55rem; }
+.upwell-title {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--navy);
+  margin-bottom: .25rem;
+}
+.upwell-hint  { font-size: .72rem; color: var(--muted); line-height: 1.6; }
+[data-testid="stFileUploader"] section {
+  border: 1.5px dashed var(--border) !important;
+  background: var(--white) !important;
+  border-radius: 12px !important;
+}
+.file-ok {
+  background: var(--ok-lt);
+  border: 1px solid var(--ok-bdr);
+  border-radius: 8px;
+  padding: .6rem 1rem;
+  font-size: .78rem;
+  color: var(--ok);
+  margin-bottom: .65rem;
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  font-weight: 500;
+}
+
+/* ── buttons ── */
+.stButton > button[kind="primary"] {
+  background: var(--navy) !important;
+  color: var(--gold) !important;
+  border: 1.5px solid var(--gold) !important;
+  border-radius: 6px !important;
+  font-family: 'Inter', sans-serif !important;
+  font-weight: 700 !important;
+  font-size: .76rem !important;
+  text-transform: uppercase;
+  letter-spacing: .12em;
+  padding: .7rem 1.5rem !important;
+  width: 100% !important;
+  transition: all .15s !important;
+}
+.stButton > button[kind="primary"]:hover {
+  background: var(--gold) !important;
+  color: var(--navy) !important;
+}
+.stButton > button[kind="primary"]:disabled { opacity: .38 !important; }
+.stButton > button[kind="secondary"] {
+  background: var(--white) !important;
+  color: var(--navy) !important;
+  border: 1.5px solid var(--border) !important;
+  border-radius: 6px !important;
+  font-family: 'Inter', sans-serif !important;
+  font-weight: 600 !important;
+  font-size: .75rem !important;
+  letter-spacing: .04em;
+  padding: .65rem 1.5rem !important;
+  width: 100% !important;
+  transition: all .15s !important;
+}
+.stButton > button[kind="secondary"]:hover {
+  border-color: var(--gold) !important;
+  color: var(--gold) !important;
+  background: rgba(191,160,90,.04) !important;
+}
+
+/* ── progress ── */
+.stProgress > div > div { background: var(--gold) !important; }
+.stAlert { border-radius: 8px !important; font-size: .8rem !important; }
+
+/* ══════════════════════
+   REPORT (left)
+══════════════════════ */
+.rpt {
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 6px 32px rgba(9,25,47,.09);
+  margin-top: 1rem;
+}
+.rpt-head {
+  background: var(--navy);
+  padding: 1.6rem 2rem 1.4rem;
+  border-bottom: 2px solid var(--gold);
+}
+.rpt-head-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: .8rem;
+}
+.rpt-badge {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: .5rem;
+  letter-spacing: .28em;
+  text-transform: uppercase;
+  color: var(--gold);
+  border: 1px solid rgba(191,160,90,.35);
+  padding: .15rem .5rem;
+  border-radius: 2px;
+}
+.rpt-meta {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: .5rem;
+  color: rgba(255,255,255,.2);
+  text-align: right;
+  line-height: 1.9;
+}
+.rpt-title {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.55rem;
+  font-weight: 700;
+  color: #FFF;
+  margin: 0 0 .2rem;
+  letter-spacing: -.01em;
+}
+.rpt-sub {
+  font-size: .6rem;
+  color: rgba(255,255,255,.35);
+  text-transform: uppercase;
+  letter-spacing: .14em;
+}
+.rpt-body { padding: 2rem; }
+
+.sec-hdr {
+  display: flex;
+  align-items: center;
+  gap: .65rem;
+  margin: 2.1rem 0 .8rem;
+  padding-bottom: .5rem;
+  border-bottom: 1.5px solid var(--cream);
+}
+.sec-hdr:first-child { margin-top: 0; }
+.sec-num {
+  background: var(--navy);
+  color: var(--gold);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: .6rem;
+  font-weight: 600;
+  width: 1.55rem;
+  height: 1.55rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.sec-title {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--navy);
+}
+.sec-sub {
+  font-size: .64rem;
+  color: var(--muted);
+  margin-left: auto;
+  font-style: italic;
+}
+
+/* report section cards */
+.card-exp {
+  background: var(--bad-lt);
+  border: 1px solid var(--bad-bdr);
+  border-left: 3px solid var(--bad);
+  border-radius: 6px;
+  padding: .85rem 1.05rem;
+  margin-bottom: .45rem;
+  font-size: .82rem; color: var(--slate); line-height: 1.72;
+}
+.card-str {
+  background: var(--warn-lt);
+  border: 1px solid var(--warn-bdr);
+  border-left: 3px solid var(--warn);
+  border-radius: 6px;
+  padding: .85rem 1.05rem;
+  margin-bottom: .45rem;
+  font-size: .82rem; color: var(--slate); line-height: 1.72;
+}
+.card-rec {
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--gold);
+  border-radius: 6px;
+  padding: .85rem 1.05rem;
+  margin-bottom: .45rem;
+  font-size: .82rem; color: var(--slate); line-height: 1.72;
+}
+.card-sav {
+  background: var(--ok-lt);
+  border: 1px solid var(--ok-bdr);
+  border-left: 3px solid var(--ok);
+  border-radius: 6px;
+  padding: .85rem 1.05rem;
+  margin-bottom: .45rem;
+  font-size: .82rem; color: var(--slate); line-height: 1.72;
+}
+.card-total {
+  background: var(--navy);
+  border-radius: 8px;
+  padding: 1.2rem 1.6rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1.5rem;
+  margin: .75rem 0;
+}
+.total-lbl {
+  font-size: .56rem;
+  text-transform: uppercase;
+  letter-spacing: .18em;
+  color: rgba(255,255,255,.38);
+  margin-bottom: .22rem;
+}
+.total-amt {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.7rem;
+  font-weight: 700;
+  color: var(--gold);
+}
+.total-txt {
+  font-size: .78rem;
+  color: rgba(255,255,255,.5);
+  line-height: 1.6;
+  max-width: 55%;
+}
+.verdict-full    { background:#E8F7F2; border:1px solid #5DC5A0; border-left:4px solid var(--ok);   border-radius:6px; padding:1rem 1.2rem; margin-bottom:.45rem; }
+.verdict-partial { background:var(--warn-lt); border:1px solid var(--warn-bdr); border-left:4px solid var(--warn); border-radius:6px; padding:1rem 1.2rem; margin-bottom:.45rem; }
+.verdict-limited { background:var(--bad-lt); border:1px solid var(--bad-bdr); border-left:4px solid var(--bad);  border-radius:6px; padding:1rem 1.2rem; margin-bottom:.45rem; }
+.verdict-tag     { font-family:'Cormorant Garamond',serif; font-size:.97rem; font-weight:700; margin-bottom:.38rem; }
+.verdict-body    { font-size:.82rem; color:var(--slate); line-height:1.72; }
+.disclaimer {
+  background: #F2EFE8;
+  border: 1px solid var(--b2);
+  border-radius: 6px;
+  padding: .95rem 1.15rem;
+  margin-top: 1.6rem;
+  display: flex;
+  gap: .6rem;
+  align-items: flex-start;
+}
+.disclaimer-txt { font-size: .73rem; color: var(--muted); line-height: 1.7; }
+.disclaimer-txt strong { color: var(--slate); }
+
+/* ══════════════════════════════════════════════════════════════════
+   RIGHT PANEL — PRE-ANALYSIS WELCOME
+══════════════════════════════════════════════════════════════════ */
+.welcome-card {
+  background: var(--white);
+  border: 1px solid var(--b2);
+  border-radius: 12px;
+  padding: 1.6rem 1.75rem 1.5rem;
+  margin-bottom: 1rem;
+}
+.welcome-icon {
+  font-size: 2rem;
+  display: block;
+  margin-bottom: .65rem;
+}
+.welcome-title {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--navy);
+  margin-bottom: .45rem;
+}
+.welcome-body {
+  font-size: .82rem;
+  color: var(--slate);
+  line-height: 1.68;
+}
+.stat-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: .65rem;
+  margin: 1.1rem 0 0;
+}
+.stat-box {
+  background: var(--cream);
+  border: 1px solid var(--b2);
+  border-radius: 8px;
+  padding: .8rem 1rem;
+  text-align: center;
+}
+.stat-val {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--navy);
+  line-height: 1;
+  margin-bottom: .2rem;
+}
+.stat-lbl {
+  font-size: .66rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+/* how-it-works */
+.how-row {
+  display: flex;
+  gap: .75rem;
+  margin: 1rem 0;
+}
+.how-step {
+  flex: 1;
+  background: var(--white);
+  border: 1px solid var(--b2);
+  border-radius: 10px;
+  padding: .9rem .75rem;
+  text-align: center;
+}
+.how-circle {
+  width: 1.8rem; height: 1.8rem;
+  background: var(--navy);
+  color: var(--gold);
+  border-radius: 50%;
+  font-size: .68rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto .5rem;
+  font-family: 'IBM Plex Mono', monospace;
+}
+.how-title { font-size: .75rem; font-weight: 700; color: var(--navy); margin-bottom: .18rem; }
+.how-desc  { font-size: .67rem; color: var(--muted); line-height: 1.45; }
+
+/* category mini-tags */
+.cat-tag-row { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .8rem; }
+.cat-tag {
+  font-size: .62rem;
+  font-weight: 500;
+  padding: .2rem .55rem;
+  border-radius: 20px;
+  border: 1px solid var(--b2);
+  background: var(--cream);
+  color: var(--slate);
+  display: flex;
+  align-items: center;
+  gap: .25rem;
+  white-space: nowrap;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   RIGHT PANEL — RECOMMENDED STRATEGIES (post-analysis)
+══════════════════════════════════════════════════════════════════ */
+
+/* summary bar across top of right panel */
+.rec-summary {
+  background: var(--navy);
+  border-radius: 10px;
+  padding: 1.1rem 1.4rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.1rem;
+}
+.rec-summary-left {
+  flex: 1;
+}
+.rec-summary-title {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1rem;
+  font-weight: 700;
+  color: #FFF;
+  margin-bottom: .15rem;
+}
+.rec-summary-sub {
+  font-size: .65rem;
+  color: rgba(255,255,255,.45);
+  letter-spacing: .03em;
+}
+.rec-summary-count {
+  background: rgba(191,160,90,.15);
+  border: 1px solid rgba(191,160,90,.35);
+  border-radius: 8px;
+  padding: .55rem .85rem;
+  text-align: center;
+}
+.rec-count-num {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--gold);
+  line-height: 1;
+}
+.rec-count-lbl {
+  font-size: .58rem;
+  color: rgba(255,255,255,.4);
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  margin-top: .15rem;
+}
+
+/* individual recommended strategy card */
+.strat-card {
+  background: var(--white);
+  border: 1px solid var(--b2);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: .85rem;
+  box-shadow: 0 2px 10px rgba(9,25,47,.05);
+  transition: box-shadow .18s, transform .18s;
+}
+.strat-card:hover {
+  box-shadow: 0 5px 20px rgba(9,25,47,.1);
+  transform: translateY(-1px);
+}
+.strat-card-body { padding: 1rem 1.1rem .85rem; }
+.strat-icon-row {
+  display: flex;
+  align-items: flex-start;
+  gap: .7rem;
+  margin-bottom: .5rem;
+}
+.strat-icon-bubble {
+  width: 2.4rem; height: 2.4rem;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  flex-shrink: 0;
+}
+.strat-name {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 1.02rem;
+  font-weight: 700;
+  color: var(--navy);
+  line-height: 1.2;
+  margin-bottom: .12rem;
+}
+.strat-irc {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: .6rem;
+  color: var(--muted);
+}
+.strat-savings-badge {
+  margin-left: auto;
+  background: var(--ok-lt);
+  border: 1px solid var(--ok-bdr);
+  border-radius: 6px;
+  padding: .28rem .65rem;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: .68rem;
+  font-weight: 600;
+  color: var(--ok);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.strat-desc {
+  font-size: .8rem;
+  color: var(--slate);
+  line-height: 1.68;
+  margin-bottom: .6rem;
+}
+.strat-footer {
+  background: var(--cream);
+  border-top: 1px solid var(--b2);
+  padding: .55rem 1.1rem;
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  flex-wrap: wrap;
+}
+.tag {
+  font-size: .6rem;
+  font-weight: 600;
+  padding: .15rem .5rem;
+  border-radius: 20px;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: .22rem;
+}
+.tag-cat  { background: #EEF1F8; color: #1A3A6B; }
+.tag-time { background: var(--ok-lt); color: #0A5C44; }
+.tag-ph   { background: var(--warn-lt); color: #7A5010; }
+
+/* generic prose card for unmatched paragraphs */
+.strat-card-plain {
+  background: var(--white);
+  border: 1px solid var(--b2);
+  border-left: 3px solid var(--gold);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+  margin-bottom: .7rem;
+  font-size: .82rem;
+  color: var(--slate);
+  line-height: 1.7;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   LIBRARY DIALOG
+══════════════════════════════════════════════════════════════════ */
+.lib-intro {
+  font-size: .78rem;
+  color: var(--muted);
+  line-height: 1.6;
+  padding: .75rem 0 .25rem;
+}
+.lib-cat-title {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  font-family: 'Cormorant Garamond', serif;
+  font-size: .95rem;
+  font-weight: 700;
+  color: var(--navy);
+  padding: .4rem 0 .3rem;
+  border-bottom: 1px solid var(--b2);
+  margin: 1rem 0 .5rem;
+}
+.lib-cat-title:first-of-type { margin-top: 0; }
+.lib-cat-count { font-family: 'IBM Plex Mono', monospace; font-size: .6rem; color: var(--muted); font-weight: 400; }
+.lib-item {
+  display: flex;
+  align-items: flex-start;
+  gap: .55rem;
+  background: var(--cream);
+  border: 1px solid var(--b2);
+  border-radius: 7px;
+  padding: .6rem .8rem;
+  margin-bottom: .32rem;
+}
+.lib-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: .28rem; }
+.lib-item-main { flex: 1; min-width: 0; }
+.lib-item-name { font-size: .78rem; font-weight: 600; color: var(--navy); line-height: 1.3; margin-bottom: .18rem; }
+.lib-item-desc { font-size: .7rem; color: var(--muted); line-height: 1.4; }
+.lib-item-right { flex-shrink: 0; text-align: right; }
+.lib-item-irc { font-family: 'IBM Plex Mono', monospace; font-size: .58rem; color: var(--muted); margin-bottom: .18rem; }
+.lib-badge {
+  font-size: .57rem;
+  font-weight: 700;
+  padding: .1rem .38rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  display: inline-block;
+}
+.lib-ph1 { background: #E4EEF8; color: #163870; }
+.lib-ph2 { background: #F0EDE4; color: #6B5920; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CATEGORY PALETTE
+# ══════════════════════════════════════════════════════════════════════════════
+_CAT = {
+    "Entity & Income Structuring":  ("#B83020", "🏢", "#FDEEED"),
+    "Retirement & Benefits":        ("#A07830", "🏦", "#FBF5E6"),
+    "Deduction & Reimbursement":    ("#0E7A62", "📋", "#E6F5F0"),
+    "Real Estate & Depreciation":   ("#1E50C0", "🏠", "#EBF0FB"),
+    "Credits & Special Incentives": ("#6030B8", "⭐", "#F0E8FC"),
+    "Alternative Investments":      ("#B86010", "📈", "#FDF3E5"),
+    "Charitable & Community":       ("#B02070", "🤝", "#FCEAF4"),
+    "SALT & State Planning":        ("#0878A0", "🗺️", "#E6F3F8"),
+}
+def _cc(c):  return _CAT.get(c, ("#6B7280", "•",  "#F3F4F6"))[0]
+def _ci(c):  return _CAT.get(c, ("#6B7280", "•",  "#F3F4F6"))[1]
+def _cbg(c): return _CAT.get(c, ("#6B7280", "•",  "#F3F4F6"))[2]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY LOOKUP
+# ══════════════════════════════════════════════════════════════════════════════
+_BY_NAME = {s["name"].lower(): s for s in STRATEGY_LIBRARY}
+
+def _match_strategy(para: str):
+    """Match a paragraph to a strategy by name or IRC citation."""
+    tl = para.lower()
+    for name, s in _BY_NAME.items():
+        # Match on first 4 meaningful words
+        words = [w for w in name.split() if len(w) > 2][:4]
+        if len(words) >= 2 and all(w in tl for w in words):
+            return s
+    # Fall back to IRC
+    for s in STRATEGY_LIBRARY:
+        for part in re.split(r"[,;]", s["irc"]):
+            part = part.strip()
+            if len(part) > 5 and part.lower() in tl:
+                return s
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PDF EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
+def _extract(path: str) -> str:
+    if not PDF_OK:
+        raise ImportError("Run: pip install pdfplumber")
+    pages = []
+    with pdfplumber.open(path) as f:
+        for pg in f.pages:
+            t = pg.extract_text()
+            if t: pages.append(t)
+    return "\n\n".join(pages)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PROMPTS
+# ══════════════════════════════════════════════════════════════════════════════
+_SYS = """You are a senior tax architect with two decades of practice advising high-income dental practice owners across the United States. You have personally reviewed thousands of returns. You know the patterns — what dental practice owners miss year after year, what general-practice CPAs overlook, and where the real money sits unclaimed.
+
+You do not produce checklists. You read the specific return in front of you and write a private client memorandum that reflects exactly those numbers, those forms, that state, that entity structure.
+
+Your voice is that of a trusted senior advisor: direct, precise, and occasionally blunt. You never use filler phrases like "it is important to note," "it is worth mentioning," or "you may wish to consider." You state findings as facts. You quantify everything that can be quantified. When something is wrong, you name it plainly and say what it costs. When an opportunity exists, you say how much it is worth.
+
+Every dollar figure comes from the return or from a calculation you can defend. Every strategy you recommend has direct evidentiary support in the data. You never recommend what you cannot justify.
+
+When strategies carry state-level nuance, you name the state and the specific issue. IRC citations are woven naturally into sentences rather than appended as tags.
+
+OUTPUT FORMAT — STRICT:
+Produce exactly five sections using the exact headers listed below. Inside each section write only in flowing prose paragraphs. Each finding or strategy is its own paragraph, separated by a blank line. No bullet points. No numbered lists. No tables. No sub-headers within sections. No markdown. Nothing before Section I. Nothing after the disclaimer in Section V."""
+
+
+def _build_prompt(raw: str) -> str:
+    strats = "\n".join(f"  • {s['name']}  ({s['irc']})" for s in STRATEGY_LIBRARY)
+    return f"""Analyze the tax return data and produce a five-section Tax Architecture Assessment.
+Only recommend strategies from the approved list where the return contains direct supporting evidence.
+
+APPROVED STRATEGY UNIVERSE:
+{strats}
+
+────────────────────────────────────────────────
+TAX RETURN DATA:
+────────────────────────────────────────────────
+{raw[:34000]}
+────────────────────────────────────────────────
+
+Use these exact headers. Prose paragraphs only — never lists, tables, or sub-headers.
+
+SECTION I — TAX EXPOSURE ANALYSIS
+Every active tax exposure: unshielded income flows, missing forms, excess SE tax, audit-risk patterns, state compliance gaps. Reference actual line items and dollar figures. Each problem is its own paragraph.
+
+SECTION II — STRUCTURAL INEFFICIENCIES
+Business architecture: entity type, W-2 salary calibration, retirement funding, expense categorization, missing management company or real estate separation. Each gap is its own paragraph with dollar context.
+
+SECTION III — RECOMMENDED STRATEGIES
+Only strategies from the list above with direct evidentiary support. For each: weave the IRC citation naturally into the opening sentence, explain plainly, cite the specific return data, and note state non-conformity by name. Each strategy is its own paragraph.
+
+SECTION IV — DOLLAR IMPACT ESTIMATES
+For each strategy in Section III: a specific conservative-to-optimistic federal savings range in prose. End with a summary paragraph stating the combined total as a dollar range and as a percentage of current federal liability.
+
+SECTION V — TAX PROTECTION VERDICT
+Clear verdict. Federal reduction potential, state conformity by strategy, classification — exactly one of: Full Protection Achievable, Partial Protection Achievable, or Protection Limited. State classification in one clear sentence. Then implementation steps. Close with this disclaimer word for word as its own paragraph:
+
+"All findings in this assessment are prepared for review by a licensed tax architect and do not constitute finalized tax advice. Implementation of any strategy described here should be undertaken only with the guidance of a qualified tax professional who has reviewed the complete facts and circumstances of your situation." """
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LLM CALL
+# ══════════════════════════════════════════════════════════════════════════════
+def _call_ai(key: str, model: str, sys_p: str, usr_p: str) -> str:
+    import requests as rq
+    r = rq.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type":  "application/json",
+            "HTTP-Referer":  "https://dentist-tax-system.com",
+            "X-Title":       "Dentists Tax Architecture System",
+        },
+        json={
+            "model":       model,
+            "messages":    [{"role":"system","content":sys_p},{"role":"user","content":usr_p}],
+            "max_tokens":  4200,
+            "temperature": 0.13,
+        },
+        timeout=120,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+_SK = ["SECTION I","SECTION II","SECTION III","SECTION IV","SECTION V"]
+
+def _parse(txt: str) -> dict:
+    out = {}
+    for i, k in enumerate(_SK):
+        idx = txt.find(k)
+        if idx == -1: out[k] = ""; continue
+        nxt = len(txt)
+        if i < 4:
+            j = txt.find(_SK[i+1], idx+1)
+            if j != -1: nxt = j
+        chunk = txt[idx:nxt]
+        lines, skip = [], False
+        for ln in chunk.splitlines():
+            s = ln.strip()
+            if s.startswith("═") or s.startswith("─"): continue
+            if s.startswith(k): skip = True; continue
+            if skip:
+                if s == "": continue
+                if s.startswith("(") and len(s) > 55: continue
+                skip = False
+            lines.append(ln)
+        out[k] = "\n".join(lines).strip()
+    return out
+
+def _pp(t: str):
+    return [p.strip() for p in t.split("\n\n") if p.strip()]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FULL REPORT RENDERER (left panel)
+# ══════════════════════════════════════════════════════════════════════════════
+def render_report(ai: str, fname: str = ""):
+    now = datetime.utcnow()
+    did = f"DTTS-{now.strftime('%Y%m%d-%H%M')}"
+    secs = _parse(ai)
+
+    st.markdown(f"""
+<div class="rpt">
+  <div class="rpt-head">
+    <div class="rpt-head-row">
+      <span class="rpt-badge">Confidential</span>
+      <div class="rpt-meta">
+        Doc: {did}<br>
+        {now.strftime("%b %d, %Y · %H:%M UTC")}<br>
+        {"File: " + fname if fname else "Uploaded return"}
+      </div>
+    </div>
+    <div class="rpt-title">Tax Architecture Assessment</div>
+    <div class="rpt-sub">Dental Practice &nbsp;·&nbsp; Phase 1 &nbsp;·&nbsp; Return-Only</div>
+  </div>
+  <div class="rpt-body">
+""", unsafe_allow_html=True)
+
+    SECS = [
+        ("SECTION I",   "I",   "Tax Exposure Analysis",      "Problems found in your return",             "card-exp"),
+        ("SECTION II",  "II",  "Structural Inefficiencies",  "Business architecture gaps",                "card-str"),
+        ("SECTION III", "III", "Recommended Strategies",     "IRS-approved strategies for your situation","card-rec"),
+        ("SECTION IV",  "IV",  "Dollar Impact Estimates",    "How much you could save",                   "card-sav"),
+        ("SECTION V",   "V",   "Tax Protection Verdict",     "What's achievable for you",                 "card-rec"),
+    ]
+
+    for k, num, title, sub, dfl in SECS:
+        body = secs.get(k, "")
+        ps   = _pp(body)
+
+        st.markdown(f"""
+<div class="sec-hdr">
+  <div class="sec-num">{num}</div>
+  <div class="sec-title">{title}</div>
+  <div class="sec-sub">{sub}</div>
+</div>
+""", unsafe_allow_html=True)
+
+        if not ps:
+            st.markdown('<p style="color:#9CA3AF;font-style:italic;font-size:.8rem;">No content extracted.</p>',
+                        unsafe_allow_html=True)
+            continue
+
+        for para in ps:
+
+            # Section V — verdict + disclaimer
+            if k == "SECTION V":
+                is_disc = ("licensed tax architect" in para.lower()
+                           or "do not constitute finalized" in para.lower())
+                if is_disc:
+                    st.markdown(f"""
+<div class="disclaimer">
+  <div style="font-size:.95rem;flex-shrink:0;margin-top:.05rem;">⚖️</div>
+  <div class="disclaimer-txt"><strong>Professional Disclaimer — </strong>{para}</div>
+</div>""", unsafe_allow_html=True)
+                    continue
+                if "Full Protection Achievable" in para:
+                    vc, vt, vtc = "verdict-full",    "✓ Full Protection Achievable",    "#0A6050"
+                elif "Partial Protection Achievable" in para:
+                    vc, vt, vtc = "verdict-partial", "⚡ Partial Protection Achievable", "#8A5808"
+                elif "Protection Limited" in para:
+                    vc, vt, vtc = "verdict-limited", "⚠ Protection Limited",            "#8A1E14"
+                else:
+                    vc, vt, vtc = "verdict-partial", "", "#3D4555"
+                tag = f'<div class="verdict-tag" style="color:{vtc};">{vt}</div>' if vt else ""
+                st.markdown(f'<div class="{vc}">{tag}<div class="verdict-body">{para}</div></div>',
+                            unsafe_allow_html=True)
+                continue
+
+            # Section IV — pull out totals line
+            if k == "SECTION IV":
+                is_tot = any(x in para.lower() for x in
+                             ["across all","combined total","total annual","total savings",
+                              "all strategies","in aggregate","overall savings"])
+                if is_tot:
+                    amts = re.findall(r'\$[\d,]+(?:\s*(?:to|–|-)\s*\$[\d,]+)?', para)
+                    disp = amts[0] if amts else "See report"
+                    st.markdown(f"""
+<div class="card-total">
+  <div>
+    <div class="total-lbl">Combined Annual Savings Estimate</div>
+    <div class="total-amt">{disp}</div>
+  </div>
+  <div class="total-txt">{para}</div>
+</div>""", unsafe_allow_html=True)
+                    continue
+
+            st.markdown(f'<div class="{dfl}">{para}</div>', unsafe_allow_html=True)
+
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.download_button(
+        "⬇  Download Full Assessment (PDF)",
+        data=ai, file_name=f"tax_assessment_{did}.txt", mime="text/plain",
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RIGHT PANEL — PRE-ANALYSIS WELCOME
+# ══════════════════════════════════════════════════════════════════════════════
+def render_welcome():
+    cats = sorted(set(s.get("category","Other") for s in STRATEGY_LIBRARY))
+    tags = "".join(
+        f'<span class="cat-tag">{_ci(c)}&nbsp;{c}</span>'
+        for c in cats
+    )
+    n_strats = len(STRATEGY_LIBRARY)
+
+    st.markdown(f"""
+<div class="welcome-card">
+  <span class="welcome-icon">🔍</span>
+  <div class="welcome-title">Your personal tax review starts here</div>
+  <div class="welcome-body">
+    Upload your tax return and this system will read it line by line —
+    finding what you're overpaying, what's missing, and which of our
+    <strong>{n_strats} dental-specific strategies</strong> apply to your exact situation.
+    No accountant required to get started.
+  </div>
+  <div class="stat-row">
+    <div class="stat-box">
+      <div class="stat-val">{n_strats}</div>
+      <div class="stat-lbl">Dental tax strategies in our library</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val">5</div>
+      <div class="stat-lbl">Report sections covering every angle</div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown("""
+<div style="font-size:.62rem;font-weight:700;text-transform:uppercase;
+            letter-spacing:.18em;color:var(--muted);margin:.5rem 0 .45rem;">
+  How it works
+</div>
+<div class="how-row">
+  <div class="how-step">
+    <div class="how-circle">1</div>
+    <div class="how-title">Upload</div>
+    <div class="how-desc">Drop in your PDF tax return — any standard form</div>
+  </div>
+  <div class="how-step">
+    <div class="how-circle">2</div>
+    <div class="how-title">Analyze</div>
+    <div class="how-desc">AI matches your return against 50 proven strategies</div>
+  </div>
+  <div class="how-step">
+    <div class="how-circle">3</div>
+    <div class="how-title">Review</div>
+    <div class="how-desc">Get a plain-English report with dollar savings estimates</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="font-size:.62rem;font-weight:700;text-transform:uppercase;
+            letter-spacing:.18em;color:var(--muted);margin:.5rem 0 .4rem;">
+  Strategies covered
+</div>
+<div class="cat-tag-row">{tags}</div>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RIGHT PANEL — RECOMMENDED STRATEGIES (post-analysis)
+# ══════════════════════════════════════════════════════════════════════════════
+def render_recommended(ai: str):
+    secs  = _parse(ai)
+    ps    = _pp(secs.get("SECTION III", ""))
+    count = len(ps)
+
+    # ── Summary banner ──
+    st.markdown(f"""
+<div class="rec-summary">
+  <div class="rec-summary-left">
+    <div class="rec-summary-title">Your Recommended Strategies</div>
+    <div class="rec-summary-sub">Based on your specific return — only what applies to you</div>
+  </div>
+  <div class="rec-summary-count">
+    <div class="rec-count-num">{count}</div>
+    <div class="rec-count-lbl">strategies found</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    if not ps:
+        st.info("No strategy recommendations were extracted from this return.")
+        return
+
+    # ── Render each strategy ──
+    for para in ps:
+        s = _match_strategy(para)
+
+        # Extract savings figure if present
+        amts = re.findall(r'\$[\d,]+(?:\s*(?:to|–|-)\s*\$[\d,]+)?', para)
+        savings_html = (
+            f'<div class="strat-savings-badge">💰 {amts[0]}</div>' if amts else ""
+        )
+
+        if s:
+            cat   = s.get("category", "Strategy")
+            color = _cc(cat)
+            icon  = _ci(cat)
+            bg    = _cbg(cat)
+            days  = s.get("speed_days", "?")
+            ph1   = s.get("phase_1_eligible", True)
+            ph_lbl= "Phase 1 — Can start now" if ph1 else "Phase 2 — Plan ahead"
+
+            st.markdown(f"""
+<div class="strat-card">
+  <div class="strat-card-body">
+    <div class="strat-icon-row">
+      <div class="strat-icon-bubble" style="background:{bg};">
+        <span>{icon}</span>
+      </div>
+      <div style="flex:1;min-width:0;">
+        <div class="strat-name">{s['name']}</div>
+        <div class="strat-irc">{s['irc']}</div>
+      </div>
+      {savings_html}
+    </div>
+    <div class="strat-desc">{para}</div>
+  </div>
+  <div class="strat-footer">
+    <span class="tag tag-cat" style="background:{bg};color:{color};">{icon} {cat}</span>
+    <span class="tag tag-time">⏱ {days} days to implement</span>
+    <span class="tag tag-ph">{ph_lbl}</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+        else:
+            # Fallback for unmatched paragraphs
+            st.markdown(f"""
+<div class="strat-card">
+  <div class="strat-card-body">
+    <div class="strat-icon-row">
+      <div class="strat-icon-bubble" style="background:#FBF5E6;">
+        <span>📌</span>
+      </div>
+      <div style="flex:1;">
+        <div class="strat-name">Additional Recommendation</div>
+        <div class="strat-irc">See full report for IRC reference</div>
+      </div>
+      {savings_html}
+    </div>
+    <div class="strat-desc">{para}</div>
+  </div>
+  <div class="strat-footer">
+    <span class="tag tag-cat">📋 Strategy</span>
+    <span class="tag tag-time">⏱ Review with advisor</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY LIBRARY DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+@st.dialog("📚  Complete Strategy Library", width="large")
+def open_library_dialog():
+    if not STRAT_OK or not STRATEGY_LIBRARY:
+        st.warning("Strategy library not loaded — ensure new_strategies.py is in the same folder.")
+        return
+
+    by_cat: dict = defaultdict(list)
+    for s in STRATEGY_LIBRARY:
+        by_cat[s.get("category","Other")].append(s)
+
+    st.markdown(f"""
+<div class="lib-intro">
+  Our full library contains <strong>{len(STRATEGY_LIBRARY)} IRS-approved tax strategies</strong>
+  built specifically for dental practice owners.
+  After uploading your return, this system identifies which of these apply to your situation.
+</div>
+""", unsafe_allow_html=True)
+
+    for cat in sorted(by_cat.keys()):
+        strats = by_cat[cat]
+        color  = _cc(cat)
+        icon   = _ci(cat)
+
+        st.markdown(f"""
+<div class="lib-cat-title">
+  <span style="color:{color};">{icon}</span>
+  {cat}
+  <span class="lib-cat-count">— {len(strats)} strategies</span>
+</div>
+""", unsafe_allow_html=True)
+
+        for s in strats:
+            ph1   = s.get("phase_1_eligible", True)
+            desc  = s.get("plain_english", "")
+            # Trim for display
+            if len(desc) > 120:
+                desc = desc[:117] + "…"
+
+            st.markdown(f"""
+<div class="lib-item">
+  <div class="lib-dot" style="background:{color};"></div>
+  <div class="lib-item-main">
+    <div class="lib-item-name">{s['name']}</div>
+    {f'<div class="lib-item-desc">{desc}</div>' if desc else ''}
+  </div>
+  <div class="lib-item-right">
+    <div class="lib-item-irc">{s['irc']}</div>
+    <span class="lib-badge {'lib-ph1' if ph1 else 'lib-ph2'}">{'Phase 1' if ph1 else 'Phase 2'}</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+def _sidebar() -> dict:
+    with st.sidebar:
+        st.markdown("""
+<div style="padding:1.4rem 0 1rem;">
+  <div style="font-family:'Cormorant Garamond',serif;font-size:1.2rem;
+              font-weight:700;color:#BFA05A;line-height:1.28;">
+    Dentists' Tax<br>Architecture™
+  </div>
+  <div style="font-size:.55rem;text-transform:uppercase;letter-spacing:.22em;
+              color:#404B60;margin-top:.35rem;font-weight:600;">
+    Phase 1 &nbsp;·&nbsp; Return Analysis
+  </div>
+</div>
+<hr style="border-color:rgba(191,160,90,.15);margin:0 0 1.1rem;">
+""", unsafe_allow_html=True)
+
+        st.markdown("### API Keys")
+        api_key = st.text_input("OpenRouter API Key",
+                                value=os.getenv("OPENROUTER_API_KEY",""),
+                                type="password", placeholder="sk-or-...")
+        model   = st.text_input("Model",
+                                value=os.getenv("OPENROUTER_MODEL","anthropic/claude-3.5-sonnet"))
+
+        st.markdown("---")
+        st.markdown("### Status")
+        def _dot(ok, lbl):
+            c = "🟢" if ok else "🔴"
+            st.markdown(f'<div style="font-size:.71rem;margin-bottom:.26rem;">{c}&nbsp; {lbl}</div>',
+                        unsafe_allow_html=True)
+        _dot(bool(api_key), "OpenRouter connected")
+        _dot(PDF_OK,        "PDF reader ready")
+        _dot(STRAT_OK,      f"{len(STRATEGY_LIBRARY)} strategies loaded")
+
+        st.markdown("---")
+        st.markdown(
+            '<div style="font-size:.58rem;color:#3D4B60;line-height:1.65;">'
+            'Analysis is for professional review only. Not finalized tax advice. '
+            'Consult a licensed tax architect before implementation.'
+            '</div>',
+            unsafe_allow_html=True)
+
+    return {"key": api_key, "model": model}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    # ── Header ──
+    st.markdown("""
+<div class="phdr">
+  <div>
+    <div class="phdr-title">Dentists' Tax &amp; Business Architecture System™</div>
+    <div class="phdr-sub">Phase 1 &nbsp;·&nbsp; Tax Risk Assessment &nbsp;·&nbsp; Return-Only Analysis</div>
+  </div>
+  <div class="phdr-meta">Version 2026.02<br>Confidential<br>Phase 1</div>
+</div>
+""", unsafe_allow_html=True)
+
+    cfg = _sidebar()
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    left, right = st.columns([11, 9], gap="large")
+
+    # ═══════════════════════════════════════════
+    # LEFT — Upload + Full Report
+    # ═══════════════════════════════════════════
+    with left:
+        st.markdown('<div class="col-hdr">Upload &amp; Analyze</div>', unsafe_allow_html=True)
+
+        uploaded = st.file_uploader(
+            label="pdf_upload",
+            type=["pdf"],
+            label_visibility="collapsed",
+            help="Upload Form 1040, 1120S, 1120, or 1065 as PDF",
+        )
+
+        if uploaded:
+            st.markdown(
+                f'<div class="file-ok">✓ &nbsp;<strong>{uploaded.name}</strong>'
+                f'&nbsp;·&nbsp; {uploaded.size / 1024:.1f} KB — ready to analyze</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown("""
+<div class="upwell">
+  <span class="upwell-icon">📄</span>
+  <div class="upwell-title">Upload your tax return to begin</div>
+  <div class="upwell-hint">
+    Accepts Form 1040 · 1120S · 1120 · 1065 &nbsp;·&nbsp; PDF only<br>
+    Your file is read locally — nothing is stored or shared
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        if not cfg["key"]:
+            st.warning("⚠  Enter your OpenRouter API key in the sidebar to enable analysis.")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        go = st.button(
+            "⬡  Analyze My Return",
+            type="primary",
+            disabled=(not uploaded or not cfg["key"]),
+        )
+
+        # ── Run analysis ──
+        if uploaded and cfg["key"] and go:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(uploaded.read())
+                tmp_path = tmp.name
+
+            try:
+                prog = st.progress(0,  text="Reading your PDF…")
+                raw  = _extract(tmp_path)
+                prog.progress(20, text="PDF read successfully…")
+
+                if len(raw.strip()) < 80:
+                    st.error("Could not read text from this PDF. It may be scanned. "
+                             "Please try a text-based PDF.")
+                    Path(tmp_path).unlink(missing_ok=True)
+                    return
+
+                prog.progress(38, text="Analyzing your return — about 30 seconds…")
+                ai_txt = _call_ai(cfg["key"], cfg["model"], _SYS, _build_prompt(raw))
+
+                prog.progress(94, text="Building your report…")
+                time.sleep(0.2)
+                prog.progress(100, text="Done.")
+                prog.empty()
+
+                st.session_state.ai_result   = ai_txt
+                st.session_state.report_done = True
+                st.session_state.upload_name = uploaded.name
+
+                st.success("✓  Analysis complete — your strategies are on the right →")
+                render_report(ai_txt, fname=uploaded.name)
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+                with st.expander("Technical details"):
+                    import traceback; st.code(traceback.format_exc())
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
+        elif st.session_state.report_done and not go:
+            render_report(st.session_state.ai_result, fname=st.session_state.upload_name)
+
+    # ═══════════════════════════════════════════
+    # RIGHT — Recommended Strategies + Library
+    # ═══════════════════════════════════════════
+    with right:
+        if st.session_state.report_done:
+            st.markdown('<div class="col-hdr">Your Recommended Strategies</div>',
+                        unsafe_allow_html=True)
+            render_recommended(st.session_state.ai_result)
+        else:
+            st.markdown('<div class="col-hdr">What You\'ll Get</div>',
+                        unsafe_allow_html=True)
+            render_welcome()
+
+        # ── Explore Library button (always visible) ──
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("📚  Explore Strategy Library", type="secondary",
+                     key="lib_btn"):
+            open_library_dialog()
+        st.markdown(
+            '<div style="font-size:.67rem;color:var(--muted);text-align:center;'
+            'margin-top:.4rem;line-height:1.5;">'
+            f'Browse all {len(STRATEGY_LIBRARY)} dental-specific strategies in our library'
+            '</div>',
+            unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    main()
+Dentists' Tax & Business Architecture System™
 Streamlit Dashboard — Phase 1 Assessment Interface
 =====================================================
 Run:
