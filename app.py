@@ -1371,8 +1371,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-Dentists' Tax & Business Architecture System™
-Streamlit Dashboard — Phase 1 Assessment Interface
 =====================================================
 Run:
     pip install streamlit plotly
